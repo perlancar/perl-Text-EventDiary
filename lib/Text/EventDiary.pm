@@ -14,82 +14,47 @@ our @EXPORT_OK = qw(parse_event_diary);
 
 our %SPEC;
 
-my %event_shortcuts = (
-    d => 'drink',
-    dr => 'drink',
-    # eat
-    # poop
-    s => 'sleep',
-    sl => 'sleep',
-    u => 'urinate',
-    ur => 'urinate',
-    w => 'wake',
-);
-
-# known keys for each event
-my %event_keys = (
-    drink => {
-        vol     => {schema=>'uint*', req=>1},
-        comment => {schema=>'str*'},
-    },
-    comment => {
-    },
-    eat => {
-        comment => {schema=>'str*'},
-    },
-    poop => {
-        urgency => {schema=>[int => between=>[0,10]]},
-        comment => {schema=>'str*'},
-    },
-    urinate => {
-        urgency => {schema=>[int => between=>[0,10]]},
-        vol     => {schema=>'uint*', req=>1},
-        comment => {schema=>'str*'},
-    },
-    wake => {
-        comment => {schema=>'str*'},
-    },
-);
-
-my $vol_shortcut = {re=>qr/\bv(\d+)(?ml)\b/, code=>sub { my ($attrs, $m) = @_; $attrs->{vol} = $m->[1] },
-my %event_key_shortcuts = (
-    drink => [
-        $vol_shortcut,
-    ],
-    urinate => [
-        $vol_shortcut,
-    ],
-);
-
-$SPEC{parse_health_diary} = {
+$SPEC{parse_event_diary} = {
     v => 1.1,
-    summary => 'Parse health diary (e.g. bladder diary, sleep diary)',
-    description => <<'_',
-
-
-
-_
+    summary => 'Parse event diary',
     args => {
-        entries => {
+        diary => {
+            summary => 'Diary source text',
             schema => 'str*',
             req => 1,
-            pos => 0,
-            cmdline_src => 'stdin_or_file',
         },
-        is_bladder_diary => {
-            schema => 'bool*',
-        },
-        is_sleep_diary => {
-            schema => 'bool*',
+        spec => {
+            summary => 'Diary specification',
+            schema => 'hash*',
+            req => 1,
         },
     },
 };
-sub parse_health_diary {
+sub parse_event_diary {
     my %args = @_;
+
+    my $diary = $args{diary};
+    defined $diary or return [400, "Please specify diary"];
+
+    my $spec = $args{spec};
+    defined $spec or return [400, "Please specify spec"];
+
+    my %eventspecs; # key=name (including alias)
+    for my $name (keys %{ $spec->{events} }) {
+        my $eventspec = $spec->{events}{$name};
+        $eventspecs{$name} and warn "Duplicate event name/alias '$name'";
+        $eventspecs{$name} = $eventspec;
+        if ($eventspec->{aliases}) {
+            for my $aliasname (keys %{ $eventspec->{aliases} }) {
+                $eventspecs{$aliasname} and warn "Duplicate event name/alias '$aliasname'";
+                $eventspecs{$aliasname} = $eventspec;
+            }
+        }
+    }
 
     my @unparsed_entries;
   SPLIT_ENTRIES: {
-        if ($args{entries} =~ /\S\R\R+\S/) {
+        if ($diary =~ /\S\R\R+\S/) {
             # there is a blank line between non-blanks, assume entries are
             # written in paragraphs
             @unparsed_entries = split /\R\R+/, $args{entries};
@@ -108,17 +73,15 @@ sub parse_health_diary {
         }
     } # SPLIT_ENTRIES
 
-    my @urinations;
-    my @intakes;
   PARSE_ENTRIES: {
         my $i = 0;
         for my $uentry (@unparsed_entries) {
             my $uentry0 = $uentry;
             $i++;
             my $time;
-            $uentry =~ s/\A(\d\d)[:.]?(\d\d)(?:-(\d\d)[:.]?(\d\d))?\s*//
-                or return [400, "Entry #$i: invalid time, please start with hhmm or hh:mm: $uentry0"];
-            my ($h, $m, $h2, $m2) = ($1, $2, $3, $4);
+            $uentry =~ s/\A(?:(\d{4})-(\d{2})-(\d{2})T)?(\d\d)[:.]?(\d\d)(?:-(\d\d)[:.]?(\d\d))?\s*//
+                or return [400, "Entry #$i: invalid time, please start with YYYY-MM-DD\"T\"hh:mm or hh:mm or hhmm: $uentry0"];
+            my ($Y, $M, $D, $h, $m, $h2, $m2) = ($1, $2, $3, $4, $5, $6, $7);
             $uentry =~ s/(\w+):?\s*//
                 or return [400, "Entry #$i: event (e.g. drink, urinate) expected: $uentry"];
             my $event = $1;
@@ -368,6 +331,66 @@ sub parse_health_diary {
 
 
 =head1 DESCRIPTION
+
+
+=head1 EVENT DIARY SPECIFICATION
+
+Diary is a text containing lines of B<entries> or paragraphs of entries. If
+there is a blank line, entries are assumed to be in paragraphs; otherwise they
+are assumed to be single line each. When entries are written in paragraphs, they
+will be reformatted to be single lines first during parsing.
+
+Each entry begins with a B<timestamp>. Timestamp is one of:
+
+ YYYY-MM-DD"T"hh:mm
+ YYYY-MM-DD"T"hh:mm-H2:m2
+ hh:mm
+ hh:mm-h2:m2
+ hhmm
+ hhmm-h2m2
+
+where hh is in 24-hour format. Examples:
+
+ 2020-12-14T10:12
+ 10:12
+ 1012
+ 10:12-10:24
+
+Entries must be written chronologically.
+
+After timestamp, whitespace (one or more spaces) and B<event name> must appear.
+Examples of event name: C<urinate>, C<drink> (for a bladder diary), C<sleep>,
+C<wake>, C<rise> (for a sleep diary).
+
+Only known events, which are defined in the diary specification, are allowed.
+
+An event name can have aliases (usually shorthand), e.g. C<u> for C<urinate>,
+C<d> for C<drink>, and so on.
+
+After an event name, free text can follow (e.g. description, comment, etc).
+Attributes (pairs of name and values separated by C<=>) will be extracted from
+the free text. Attribute name should be a single word (/\b\w+\b/) while value
+can be double-quoted text or text that is ended by the nearest comma, semicolon,
+or period. Examples:
+
+ 0915 drink type=tea vol=300, pretty thirsty.
+
+Attributes are "type" (value "tea") and "vol" (value 300).
+
+ 0915 d type=tea vol=300, comment="pretty thirsty, haven't drunk for a few
+ hours"
+
+Attributes are "type" (value "tea"), "vol" (value 300), and "comment" (value
+"pretty thirsty, haven't drunk for a few hours").
+
+The diary specification also defines what keys are allowed and the type (schema)
+of each key.
+
+To ease typing, patterns can also be defined to extract keys and values from the
+free text. For example /\bv\d+\b/ is defined as a shorthand to write the C<vol>
+key:
+
+ 0915 d v300
 
 
 =head1 KEYWORDS
